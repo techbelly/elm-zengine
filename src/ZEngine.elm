@@ -40,8 +40,6 @@ module ZEngine exposing
     , phase
     , activePrompt
     , formatMoveInfo
-    , TurnEventsContext
-    , buildTurnEventsForLine
     )
 
 {-| Public surface for the elm-zengine library.
@@ -772,8 +770,6 @@ fromPublicMoveInfo info =
             EngineTypes.AtTime h m
 
 
-{-| Inputs to `buildTurnEventsForLine`. Exposed for ordering tests.
--}
 type alias TurnEventsContext =
     { finalFrame : Frame
     , previousStatusLine : Maybe StatusLine
@@ -781,13 +777,6 @@ type alias TurnEventsContext =
     }
 
 
-{-| Pure event-list construction for a line-prompt turn boundary. Ordering
-contract (covered by tests in `tests/ZEngine/EventsTest.elm`):
-OutputProduced → StatusLineChanged (when different from previous) →
-TurnCompleted → TitleDetected (only if `detectedTitle` is `Just` and the
-caller hasn't already emitted one). The final `PromptIssued` event is
-appended by the dispatch layer so it can carry the right `Prompt` variant.
--}
 buildTurnEventsForLine : TurnEventsContext -> List Event
 buildTurnEventsForLine ctx =
     let
