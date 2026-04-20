@@ -2,3 +2,4 @@ elm-stuff
 node_modules
 docs.json
 .DS_Store
+demos/*/main.js
