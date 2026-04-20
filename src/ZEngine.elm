@@ -3,20 +3,25 @@ module ZEngine exposing
     , Msg
     , Event(..)
     , Error(..)
+    , RuntimeErrorData
     , Frame(..)
     , OutputFrameData
     , InputFrameData
     , StatusLine
     , StatusLineMode(..)
     , MoveInfo(..)
-    , InputRequest
+    , Prompt(..)
     , Phase(..)
     , TurnRecord
     , new
     , update
-    , send
+    , sendLine
+    , sendChar
+    , sendSaveResult
+    , sendRestore
     , restore
     , resumeFrom
+    , foldEvents
     , transcript
     , statusLine
     , turnHistory
@@ -28,9 +33,10 @@ module ZEngine exposing
     , storyBytes
     , snapshotBytes
     , phase
+    , activePrompt
     , formatMoveInfo
-    , InputEventsContext
-    , buildInputEvents
+    , TurnEventsContext
+    , buildTurnEventsForLine
     )
 
 {-| Public surface for the elm-zengine library.
@@ -50,6 +56,7 @@ import ZEngine.Title
 import ZEngine.Types as EngineTypes exposing (TurnRecord, emptyPendingOutput)
 import ZMachine
 import ZMachine.Header
+import ZMachine.Snapshot
 import ZMachine.Types as ZTypes exposing (StepResult)
 
 
@@ -91,9 +98,11 @@ type StatusLineMode
     | ScreenRows (List String)
 
 
-type alias InputRequest =
-    { maxLength : Int
-    }
+type Prompt
+    = LinePrompt
+    | CharPrompt
+    | SavePrompt Bytes
+    | RestorePrompt
 
 
 type alias TurnRecord =
@@ -113,35 +122,37 @@ type MoveInfo
 
 type Event
     = OutputProduced Frame
-    | InputNeeded InputRequest
+    | PromptIssued Prompt
     | StatusLineChanged StatusLine
     | TurnCompleted
     | TitleDetected String
     | GameOver
-    | RuntimeError String
 
 
 type Error
     = LoadError String
     | RestoreError String
+    | RuntimeError RuntimeErrorData
+
+
+type alias RuntimeErrorData =
+    { session : Session
+    , events : List Event
+    , message : String
+    }
 
 
 type Phase
     = Loading
     | Running
-    | Waiting
+    | Waiting Prompt
     | Halted
     | Errored String
 
 
 phase : Session -> Phase
 phase (Session state) =
-    fromInternalPhase state.phase
-
-
-fromInternalPhase : Internal.Phase -> Phase
-fromInternalPhase p =
-    case p of
+    case state.phase of
         Internal.Loading ->
             Loading
 
@@ -149,7 +160,7 @@ fromInternalPhase p =
             Running
 
         Internal.Waiting ->
-            Waiting
+            Waiting (promptFromInternal state)
 
         Internal.Halted ->
             Halted
@@ -158,7 +169,31 @@ fromInternalPhase p =
             Errored message
 
 
-new : Bytes -> Result Error ( Session, Cmd Msg )
+activePrompt : Session -> Maybe Prompt
+activePrompt (Session state) =
+    Maybe.map (\_ -> promptFromInternal state) state.activePrompt
+
+
+promptFromInternal : Internal.InternalState -> Prompt
+promptFromInternal state =
+    case state.activePrompt of
+        Just (Internal.LineActive _) ->
+            LinePrompt
+
+        Just Internal.CharActive ->
+            CharPrompt
+
+        Just (Internal.SaveActive bytes) ->
+            SavePrompt bytes
+
+        Just Internal.RestoreActive ->
+            RestorePrompt
+
+        Nothing ->
+            LinePrompt
+
+
+new : Bytes -> Result Error ( Session, List Event, Cmd Msg )
 new bytes =
     case ZMachine.load bytes of
         Err err ->
@@ -167,6 +202,7 @@ new bytes =
         Ok machine ->
             Ok
                 ( Session (initialState machine bytes)
+                , []
                 , yieldCmd
                 )
 
@@ -175,7 +211,8 @@ initialState : ZMachine.ZMachine -> Bytes -> Internal.InternalState
 initialState machine bytes =
     { machine = machine
     , storyBytes = bytes
-    , inputRequest = Nothing
+    , activePrompt = Nothing
+    , inputQueue = []
     , transcript = []
     , pendingOutput = emptyPendingOutput
     , currentStatusLine = Nothing
@@ -198,7 +235,7 @@ stepBudget =
     100000
 
 
-update : Msg -> Session -> ( Session, List Event, Cmd Msg )
+update : Msg -> Session -> Result Error ( Session, List Event, Cmd Msg )
 update msg (Session state) =
     case msg of
         Yielded ->
@@ -208,37 +245,37 @@ update msg (Session state) =
             dispatch result state
 
 
-dispatch : StepResult -> Internal.InternalState -> ( Session, List Event, Cmd Msg )
+dispatch : StepResult -> Internal.InternalState -> Result Error ( Session, List Event, Cmd Msg )
 dispatch result state =
     case result of
         ZTypes.Continue events machine ->
-            ( Session
-                { state
-                    | machine = machine
-                    , phase = Internal.Running
-                    , pendingOutput = ZEngine.Output.processEvents events state.pendingOutput
-                }
-            , []
-            , yieldCmd
-            )
+            Ok
+                ( Session
+                    { state
+                        | machine = machine
+                        , phase = Internal.Running
+                        , pendingOutput = ZEngine.Output.processEvents events state.pendingOutput
+                    }
+                , []
+                , yieldCmd
+                )
 
         ZTypes.NeedInput req events machine ->
-            onNeedInput req events machine state
+            Ok (onLinePrompt req events machine state)
 
         ZTypes.NeedChar events machine ->
-            dispatch
-                (ZMachine.provideChar " " machine)
-                { state | pendingOutput = ZEngine.Output.processEvents events state.pendingOutput }
+            Ok (onNonLinePrompt Internal.CharActive CharPrompt events machine state)
 
-        ZTypes.NeedSave _ events machine ->
-            dispatch
-                (ZMachine.provideSaveResult False machine)
-                { state | pendingOutput = ZEngine.Output.processEvents events state.pendingOutput }
+        ZTypes.NeedSave snapshot events machine ->
+            let
+                saveBytes : Bytes
+                saveBytes =
+                    ZMachine.Snapshot.encode state.machine.originalMemory snapshot
+            in
+            Ok (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
 
         ZTypes.NeedRestore events machine ->
-            dispatch
-                (ZMachine.provideRestoreResult Nothing machine)
-                { state | pendingOutput = ZEngine.Output.processEvents events state.pendingOutput }
+            Ok (onNonLinePrompt Internal.RestoreActive RestorePrompt events machine state)
 
         ZTypes.Halted events machine ->
             let
@@ -250,16 +287,17 @@ dispatch result state =
                 newTranscript =
                     state.transcript ++ [ EngineTypes.OutputFrame finalOutput ]
             in
-            ( Session
-                { state
-                    | machine = machine
-                    , phase = Internal.Halted
-                    , transcript = newTranscript
-                    , pendingOutput = emptyPendingOutput
-                }
-            , [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)), GameOver ]
-            , Cmd.none
-            )
+            Ok
+                ( Session
+                    { state
+                        | machine = machine
+                        , phase = Internal.Halted
+                        , transcript = newTranscript
+                        , pendingOutput = emptyPendingOutput
+                    }
+                , [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)), GameOver ]
+                , Cmd.none
+                )
 
         ZTypes.Error err events machine ->
             let
@@ -274,31 +312,38 @@ dispatch result state =
                 message : String
                 message =
                     zmachineErrorToString err
+
+                erroredSession : Session
+                erroredSession =
+                    Session
+                        { state
+                            | machine = machine
+                            , phase = Internal.Errored message
+                            , transcript = newTranscript
+                            , pendingOutput = emptyPendingOutput
+                        }
             in
-            ( Session
-                { state
-                    | machine = machine
-                    , phase = Internal.Errored message
-                    , transcript = newTranscript
-                    , pendingOutput = emptyPendingOutput
-                }
-            , [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)), RuntimeError message ]
-            , Cmd.none
-            )
+            Err
+                (RuntimeError
+                    { session = erroredSession
+                    , events = [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)) ]
+                    , message = message
+                    }
+                )
 
 
-onNeedInput : ZTypes.LineInputInfo -> List ZTypes.OutputEvent -> ZMachine.ZMachine -> Internal.InternalState -> ( Session, List Event, Cmd Msg )
-onNeedInput req events machine state =
+onLinePrompt : ZTypes.LineInputInfo -> List ZTypes.OutputEvent -> ZMachine.ZMachine -> Internal.InternalState -> ( Session, List Event, Cmd Msg )
+onLinePrompt req events machine state =
     if state.restoringSession then
         ( Session
             { state
                 | machine = machine
                 , phase = Internal.Waiting
-                , inputRequest = Just req
+                , activePrompt = Just (Internal.LineActive req)
                 , pendingOutput = emptyPendingOutput
                 , restoringSession = False
             }
-        , [ InputNeeded (toInputRequest req) ]
+        , [ PromptIssued LinePrompt ]
         , Cmd.none
         )
 
@@ -317,13 +362,13 @@ onNeedInput req events machine state =
                     Nothing ->
                         state.currentStatusLine
 
-            newTranscript : List EngineTypes.Frame
-            newTranscript =
+            transcriptAfterOutput : List EngineTypes.Frame
+            transcriptAfterOutput =
                 state.transcript ++ [ EngineTypes.OutputFrame finalOutput ]
 
             turnRecord : Maybe EngineTypes.TurnRecord
             turnRecord =
-                ZEngine.Output.captureTurnRecord machine newStatusLine newTranscript state.turnHistory
+                ZEngine.Output.captureTurnRecord machine newStatusLine transcriptAfterOutput state.turnHistory
 
             newTurnHistory : List EngineTypes.TurnRecord
             newTurnHistory =
@@ -346,30 +391,126 @@ onNeedInput req events machine state =
             nextStoryName =
                 Maybe.withDefault state.storyName detectedTitle
 
-            events_ : List Event
-            events_ =
-                buildInputEvents
-                    { finalFrame = toPublicFrame (EngineTypes.OutputFrame finalOutput)
-                    , previousStatusLine = Maybe.map toPublicStatusLine state.currentStatusLine
-                    , detectedTitle = detectedTitle
-                    , inputRequest = toInputRequest req
-                    }
+            ctx : TurnEventsContext
+            ctx =
+                { finalFrame = toPublicFrame (EngineTypes.OutputFrame finalOutput)
+                , previousStatusLine = Maybe.map toPublicStatusLine state.currentStatusLine
+                , detectedTitle = detectedTitle
+                }
+
+            commonUpdates : Internal.InternalState -> Internal.InternalState
+            commonUpdates s =
+                { s
+                    | machine = machine
+                    , pendingOutput = emptyPendingOutput
+                    , currentStatusLine = newStatusLine
+                    , turnHistory = newTurnHistory
+                    , storyName = nextStoryName
+                    , titleEmitted = state.titleEmitted || detectedTitle /= Nothing
+                }
         in
-        ( Session
-            { state
-                | machine = machine
-                , phase = Internal.Waiting
-                , inputRequest = Just req
-                , transcript = newTranscript
-                , pendingOutput = emptyPendingOutput
-                , currentStatusLine = newStatusLine
-                , turnHistory = newTurnHistory
-                , storyName = nextStoryName
-                , titleEmitted = state.titleEmitted || detectedTitle /= Nothing
-            }
-        , events_
-        , Cmd.none
-        )
+        case state.inputQueue of
+            [] ->
+                ( Session
+                    (commonUpdates
+                        { state
+                            | phase = Internal.Waiting
+                            , activePrompt = Just (Internal.LineActive req)
+                            , transcript = transcriptAfterOutput
+                        }
+                    )
+                , buildTurnEventsForLine ctx ++ [ PromptIssued LinePrompt ]
+                , Cmd.none
+                )
+
+            next :: rest ->
+                ( Session
+                    (commonUpdates
+                        { state
+                            | phase = Internal.Running
+                            , activePrompt = Nothing
+                            , inputQueue = rest
+                            , transcript = transcriptAfterOutput ++ [ EngineTypes.InputFrame { command = next } ]
+                        }
+                    )
+                , buildTurnEventsForLine ctx
+                , Task.succeed ()
+                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideInput (truncateInput req next) req machine))
+                )
+
+
+onNonLinePrompt :
+    Internal.InternalPrompt
+    -> Prompt
+    -> List ZTypes.OutputEvent
+    -> ZMachine.ZMachine
+    -> Internal.InternalState
+    -> ( Session, List Event, Cmd Msg )
+onNonLinePrompt internalPrompt publicPrompt events machine state =
+    let
+        finalOutput : EngineTypes.PendingOutput
+        finalOutput =
+            ZEngine.Output.processEvents events state.pendingOutput
+
+        newStatusLine : Maybe ZTypes.StatusLine
+        newStatusLine =
+            case finalOutput.statusLine of
+                Just sl ->
+                    Just sl
+
+                Nothing ->
+                    state.currentStatusLine
+
+        statusChanged : Bool
+        statusChanged =
+            newStatusLine /= state.currentStatusLine
+
+        hasOutput : Bool
+        hasOutput =
+            not (String.isEmpty finalOutput.text) || finalOutput.statusLine /= Nothing
+
+        transcriptAfterOutput : List EngineTypes.Frame
+        transcriptAfterOutput =
+            if hasOutput then
+                state.transcript ++ [ EngineTypes.OutputFrame finalOutput ]
+
+            else
+                state.transcript
+
+        outputEvents : List Event
+        outputEvents =
+            if hasOutput then
+                [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)) ]
+
+            else
+                []
+
+        statusEvents : List Event
+        statusEvents =
+            case ( statusChanged, newStatusLine ) of
+                ( True, Just sl ) ->
+                    [ StatusLineChanged (toPublicStatusLine sl) ]
+
+                _ ->
+                    []
+    in
+    ( Session
+        { state
+            | machine = machine
+            , phase = Internal.Waiting
+            , activePrompt = Just internalPrompt
+            , transcript = transcriptAfterOutput
+            , pendingOutput = emptyPendingOutput
+            , currentStatusLine = newStatusLine
+        }
+    , outputEvents ++ statusEvents ++ [ PromptIssued publicPrompt ]
+    , Cmd.none
+    )
+
+
+truncateInput : ZTypes.LineInputInfo -> String -> String
+truncateInput req input =
+    String.left req.maxLength input
 
 
 toPublicFrame : EngineTypes.Frame -> Frame
@@ -404,11 +545,6 @@ toPublicStatusLineMode mode =
 
         ZTypes.ScreenRows rows ->
             ScreenRows rows
-
-
-toInputRequest : ZTypes.LineInputInfo -> InputRequest
-toInputRequest info =
-    { maxLength = info.maxLength }
 
 
 fromPublicFrame : Frame -> EngineTypes.Frame
@@ -487,28 +623,24 @@ fromPublicMoveInfo info =
             EngineTypes.AtTime h m
 
 
-{-| Inputs to `buildInputEvents`. Exposed for ordering tests.
+{-| Inputs to `buildTurnEventsForLine`. Exposed for ordering tests.
 -}
-type alias InputEventsContext =
+type alias TurnEventsContext =
     { finalFrame : Frame
     , previousStatusLine : Maybe StatusLine
     , detectedTitle : Maybe String
-    , inputRequest : InputRequest
     }
 
 
-{-| Pure event-list construction for the Waiting transition. Ordering
+{-| Pure event-list construction for a line-prompt turn boundary. Ordering
 contract (covered by tests in `tests/ZEngine/EventsTest.elm`):
 OutputProduced → StatusLineChanged (when different from previous) →
 TurnCompleted → TitleDetected (only if `detectedTitle` is `Just` and the
-caller hasn't already emitted one) → InputNeeded.
-
-`detectedTitle` is the caller's responsibility — `buildInputEvents`
-emits whatever it's given. Pass `Nothing` once the title has been
-emitted to suppress repeats.
+caller hasn't already emitted one). The final `PromptIssued` event is
+appended by the dispatch layer so it can carry the right `Prompt` variant.
 -}
-buildInputEvents : InputEventsContext -> List Event
-buildInputEvents ctx =
+buildTurnEventsForLine : TurnEventsContext -> List Event
+buildTurnEventsForLine ctx =
     let
         currentStatusLine : Maybe StatusLine
         currentStatusLine =
@@ -543,7 +675,6 @@ buildInputEvents ctx =
 
             Nothing ->
                 []
-        , [ InputNeeded ctx.inputRequest ]
         ]
 
 
@@ -563,34 +694,137 @@ zmachineErrorToString err =
             "Invalid variable: " ++ String.fromInt n
 
 
-send : String -> Session -> ( Session, Cmd Msg )
-send input (Session state) =
-    case ( state.phase, state.inputRequest ) of
-        ( Internal.Waiting, Just req ) ->
+{-| Respond to a line prompt (the common `read` case). Safe to call in any
+phase: if the engine isn't currently waiting for a line, the input is queued
+and drained at the next line prompt. Input longer than the Z-Machine's
+advertised max length is truncated on the way in.
+-}
+sendLine : String -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendLine input (Session state) =
+    let
+        command : String
+        command =
+            stripTrailingNewline input
+    in
+    case ( state.phase, state.activePrompt ) of
+        ( Internal.Waiting, Just (Internal.LineActive req) ) ->
             let
-                command : String
-                command =
-                    stripTrailingNewline input
+                truncated : String
+                truncated =
+                    truncateInput req command
 
                 newTranscript : List EngineTypes.Frame
                 newTranscript =
-                    state.transcript ++ [ EngineTypes.InputFrame { command = command } ]
+                    state.transcript ++ [ EngineTypes.InputFrame { command = truncated } ]
 
                 newState : Internal.InternalState
                 newState =
                     { state
                         | transcript = newTranscript
-                        , inputRequest = Nothing
+                        , activePrompt = Nothing
                         , phase = Internal.Running
                     }
             in
-            ( Session newState
-            , Task.succeed ()
-                |> Task.perform (\_ -> StepCompleted (ZMachine.provideInput command req state.machine))
-            )
+            Ok
+                ( Session newState
+                , []
+                , Task.succeed ()
+                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideInput truncated req state.machine))
+                )
+
+        ( Internal.Loading, _ ) ->
+            Ok ( Session { state | inputQueue = state.inputQueue ++ [ command ] }, [], Cmd.none )
+
+        ( Internal.Running, _ ) ->
+            Ok ( Session { state | inputQueue = state.inputQueue ++ [ command ] }, [], Cmd.none )
 
         _ ->
-            ( Session state, Cmd.none )
+            Ok ( Session state, [], Cmd.none )
+
+
+{-| Respond to a char prompt (`read_char`). No-op if the engine isn't
+waiting for a single character.
+-}
+sendChar : Char -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendChar c (Session state) =
+    case ( state.phase, state.activePrompt ) of
+        ( Internal.Waiting, Just Internal.CharActive ) ->
+            let
+                newState : Internal.InternalState
+                newState =
+                    { state | activePrompt = Nothing, phase = Internal.Running }
+            in
+            Ok
+                ( Session newState
+                , []
+                , Task.succeed ()
+                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideChar (String.fromChar c) state.machine))
+                )
+
+        _ ->
+            Ok ( Session state, [], Cmd.none )
+
+
+{-| Respond to an in-game save prompt. Pass `True` if the consumer has
+persisted the save bytes (from the `SavePrompt Bytes` variant), `False` on
+failure or when the consumer declines. No-op if the engine isn't waiting for
+a save result.
+-}
+sendSaveResult : Bool -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendSaveResult ok (Session state) =
+    case ( state.phase, state.activePrompt ) of
+        ( Internal.Waiting, Just (Internal.SaveActive _) ) ->
+            let
+                newState : Internal.InternalState
+                newState =
+                    { state | activePrompt = Nothing, phase = Internal.Running }
+            in
+            Ok
+                ( Session newState
+                , []
+                , Task.succeed ()
+                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideSaveResult ok state.machine))
+                )
+
+        _ ->
+            Ok ( Session state, [], Cmd.none )
+
+
+{-| Respond to an in-game restore prompt. Pass `Just bytes` to restore from
+a previously-saved snapshot (produced by `SavePrompt`), `Nothing` to decline.
+No-op if the engine isn't waiting for a restore.
+-}
+sendRestore : Maybe Bytes -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendRestore maybeBytes (Session state) =
+    case ( state.phase, state.activePrompt ) of
+        ( Internal.Waiting, Just Internal.RestoreActive ) ->
+            let
+                newState : Internal.InternalState
+                newState =
+                    { state | activePrompt = Nothing, phase = Internal.Running }
+            in
+            Ok
+                ( Session newState
+                , []
+                , Task.succeed ()
+                    |> Task.perform
+                        (\_ ->
+                            let
+                                maybeSnapshot : Maybe ZMachine.Snapshot
+                                maybeSnapshot =
+                                    maybeBytes
+                                        |> Maybe.andThen
+                                            (\bs ->
+                                                ZMachine.Snapshot.decode state.machine.originalMemory bs
+                                                    |> Result.toMaybe
+                                            )
+                            in
+                            StepCompleted (ZMachine.provideRestoreResult maybeSnapshot state.machine)
+                        )
+                )
+
+        _ ->
+            Ok ( Session state, [], Cmd.none )
 
 
 stripTrailingNewline : String -> String
@@ -610,7 +844,7 @@ restore :
     , currentStatusLine : Maybe StatusLine
     , storyName : String
     }
-    -> Result Error ( Session, Cmd Msg )
+    -> Result Error ( Session, List Event, Cmd Msg )
 restore args =
     case ZMachine.load args.story of
         Err err ->
@@ -638,11 +872,12 @@ restore args =
                                 , storyName = args.storyName
                                 , titleEmitted = not (String.isEmpty args.storyName)
                             }
+                        , []
                         , yieldCmd
                         )
 
 
-resumeFrom : TurnRecord -> Session -> ( Session, Cmd Msg )
+resumeFrom : TurnRecord -> Session -> Result Error ( Session, List Event, Cmd Msg )
 resumeFrom publicRecord (Session state) =
     let
         record : EngineTypes.TurnRecord
@@ -650,8 +885,8 @@ resumeFrom publicRecord (Session state) =
             fromPublicTurnRecord publicRecord
     in
     case ZEngine.Snapshot.restore record.snapshotBytes state.machine of
-        Err _ ->
-            ( Session state, Cmd.none )
+        Err message ->
+            Err (RestoreError message)
 
         Ok restoredMachine ->
             let
@@ -668,7 +903,7 @@ resumeFrom publicRecord (Session state) =
                     { state
                         | machine = restoredMachine
                         , phase = Internal.Running
-                        , inputRequest = Nothing
+                        , activePrompt = Nothing
                         , transcript = truncatedTranscript
                         , turnHistory = truncatedHistory
                         , pendingOutput = emptyPendingOutput
@@ -676,7 +911,7 @@ resumeFrom publicRecord (Session state) =
                         , currentStatusLine = Just (ZEngine.Output.statusLineFromTurnRecord record)
                     }
             in
-            ( Session newState, yieldCmd )
+            Ok ( Session newState, [], yieldCmd )
 
 
 transcript : Session -> List Frame
@@ -741,6 +976,25 @@ storyBytes (Session state) =
 snapshotBytes : Session -> Bytes
 snapshotBytes (Session state) =
     ZEngine.Snapshot.encode state.machine
+
+
+{-| Fold a list of events into a `(model, Cmd msg)` accumulator. Lets consumers
+write a single `Event -> model -> (model, Cmd msg)` handler and apply it to
+whatever events came back from `new` / `update` / `send` in one line. Cmds from
+each handler are batched with the seed Cmd.
+-}
+foldEvents : (Event -> m -> ( m, Cmd msg )) -> List Event -> ( m, Cmd msg ) -> ( m, Cmd msg )
+foldEvents handler events seed =
+    List.foldl
+        (\event ( m, cmd ) ->
+            let
+                ( m2, cmd2 ) =
+                    handler event m
+            in
+            ( m2, Cmd.batch [ cmd, cmd2 ] )
+        )
+        seed
+        events
 
 
 formatMoveInfo : MoveInfo -> String

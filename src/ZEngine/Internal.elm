@@ -1,5 +1,6 @@
 module ZEngine.Internal exposing
     ( InternalState
+    , InternalPrompt(..)
     , Phase(..)
     )
 
@@ -16,7 +17,8 @@ import ZMachine.Types exposing (LineInputInfo)
 type alias InternalState =
     { machine : ZMachine
     , storyBytes : Bytes
-    , inputRequest : Maybe LineInputInfo
+    , activePrompt : Maybe InternalPrompt
+    , inputQueue : List String
     , transcript : List Frame
     , pendingOutput : PendingOutput
     , currentStatusLine : Maybe StatusLine
@@ -26,6 +28,13 @@ type alias InternalState =
     , storyName : String
     , titleEmitted : Bool
     }
+
+
+type InternalPrompt
+    = LineActive LineInputInfo
+    | CharActive
+    | SaveActive Bytes
+    | RestoreActive
 
 
 type Phase
