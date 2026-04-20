@@ -24,7 +24,11 @@ module ZEngine exposing
     , sendChar
     , sendSaveResult
     , sendRestore
-    , restore
+    , SessionSnapshot
+    , snapshot
+    , encodeSnapshot
+    , snapshotDecoder
+    , restoreFrom
     , resumeFrom
     , foldEvents
     , transcript
@@ -49,7 +53,10 @@ in subsequent commits. The app does not yet import this module.
 
 -}
 
+import Base64
 import Bytes exposing (Bytes)
+import Json.Decode as D
+import Json.Encode as E
 import Process
 import Task
 import ZEngine.Internal as Internal
@@ -329,13 +336,13 @@ dispatch result state =
                 AutoChar c ->
                     Ok (onAutoRespondPrompt (ZMachine.provideChar (String.fromChar c)) events machine state)
 
-        ZTypes.NeedSave snapshot events machine ->
+        ZTypes.NeedSave machineSnapshot events machine ->
             case state.config.onSavePrompt of
                 SurfaceSave ->
                     let
                         saveBytes : Bytes
                         saveBytes =
-                            ZMachine.Snapshot.encode state.machine.originalMemory snapshot
+                            ZMachine.Snapshot.encode state.machine.originalMemory machineSnapshot
                     in
                     Ok (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
 
@@ -694,40 +701,6 @@ toPublicStatusLineMode mode =
             ScreenRows rows
 
 
-fromPublicFrame : Frame -> EngineTypes.Frame
-fromPublicFrame frame =
-    case frame of
-        OutputFrame data ->
-            EngineTypes.OutputFrame
-                { text = data.text
-                , statusLine = Maybe.map fromPublicStatusLine data.statusLine
-                }
-
-        InputFrame data ->
-            EngineTypes.InputFrame { command = data.command }
-
-
-fromPublicStatusLine : StatusLine -> ZTypes.StatusLine
-fromPublicStatusLine sl =
-    { locationId = sl.locationId
-    , locationName = sl.locationName
-    , mode = fromPublicStatusLineMode sl.mode
-    }
-
-
-fromPublicStatusLineMode : StatusLineMode -> ZTypes.StatusLineMode
-fromPublicStatusLineMode mode =
-    case mode of
-        ScoreAndTurns s t ->
-            ZTypes.ScoreAndTurns s t
-
-        TimeOfDay h m ->
-            ZTypes.TimeOfDay h m
-
-        ScreenRows rows ->
-            ZTypes.ScreenRows rows
-
-
 toPublicTurnRecord : EngineTypes.TurnRecord -> TurnRecord
 toPublicTurnRecord r =
     { index = r.index
@@ -974,46 +947,369 @@ stripTrailingNewline s =
         s
 
 
-restore :
-    { config : Config
-    , story : Bytes
-    , snapshot : Bytes
-    , transcript : List Frame
-    , turnHistory : List TurnRecord
-    , currentStatusLine : Maybe StatusLine
+{-| Serialized snapshot of a `Session`, suitable for persistence. Carries
+everything `restoreFrom` needs to rebuild a session (story bytes, machine
+snapshot, transcript, turn history, current status line, story name).
+
+Opaque so the library can evolve the internal shape without breaking
+clients — use `encodeSnapshot` / `snapshotDecoder` to move it on and off
+disk, and `restoreFrom` to turn it back into a live `Session`.
+-}
+type SessionSnapshot
+    = SessionSnapshot SnapshotInternals
+
+
+type alias SnapshotInternals =
+    { storyBytes : Bytes
+    , machineSnapshot : Maybe Bytes
+    , transcript : List EngineTypes.Frame
+    , turnHistory : List EngineTypes.TurnRecord
+    , currentStatusLine : Maybe ZTypes.StatusLine
     , storyName : String
     }
-    -> Result Error ( Session, List Event, Cmd Msg )
-restore args =
-    case ZMachine.load args.story of
+
+
+{-| Capture a session's state for persistence. The resulting snapshot is
+self-contained — pass it to `restoreFrom` later to rebuild the session.
+-}
+snapshot : Session -> SessionSnapshot
+snapshot (Session state) =
+    SessionSnapshot
+        { storyBytes = state.storyBytes
+        , machineSnapshot = Just (ZEngine.Snapshot.encode state.machine)
+        , transcript = state.transcript
+        , turnHistory = state.turnHistory
+        , currentStatusLine = state.currentStatusLine
+        , storyName = state.storyName
+        }
+
+
+{-| Rebuild a `Session` from a previously-captured snapshot. If the snapshot
+lacks a machine snapshot (legacy saves that predate snapshot capture), falls
+back to starting a fresh session from the story bytes.
+-}
+restoreFrom : Config -> SessionSnapshot -> Result Error ( Session, List Event, Cmd Msg )
+restoreFrom config (SessionSnapshot snap) =
+    case ZMachine.load snap.storyBytes of
         Err err ->
             Err (LoadError err)
 
         Ok freshMachine ->
-            case ZEngine.Snapshot.restore args.snapshot freshMachine of
-                Err message ->
-                    Err (RestoreError message)
-
-                Ok restoredMachine ->
-                    let
-                        base : InternalState
-                        base =
-                            initialState args.config restoredMachine args.story
-                    in
+            case effectiveMachineSnapshot snap of
+                Nothing ->
                     Ok
-                        ( Session
-                            { base
-                                | restoringSession = True
-                                , phase = Internal.Running
-                                , transcript = List.map fromPublicFrame args.transcript
-                                , turnHistory = List.map fromPublicTurnRecord args.turnHistory
-                                , currentStatusLine = Maybe.map fromPublicStatusLine args.currentStatusLine
-                                , storyName = args.storyName
-                                , titleEmitted = not (String.isEmpty args.storyName)
-                            }
+                        ( Session (initialState config freshMachine snap.storyBytes)
                         , []
                         , yieldCmd
                         )
+
+                Just machineSnapshot ->
+                    case ZEngine.Snapshot.restore machineSnapshot freshMachine of
+                        Err message ->
+                            Err (RestoreError message)
+
+                        Ok restoredMachine ->
+                            let
+                                base : InternalState
+                                base =
+                                    initialState config restoredMachine snap.storyBytes
+                            in
+                            Ok
+                                ( Session
+                                    { base
+                                        | restoringSession = True
+                                        , phase = Internal.Running
+                                        , transcript = snap.transcript
+                                        , turnHistory = snap.turnHistory
+                                        , currentStatusLine = snap.currentStatusLine
+                                        , storyName = snap.storyName
+                                        , titleEmitted = not (String.isEmpty snap.storyName)
+                                    }
+                                , []
+                                , yieldCmd
+                                )
+
+
+{-| Pick the best available machine snapshot: the one captured at save time
+if present, otherwise the most recent turn-history snapshot. Legacy saves
+wrote the machine state into the last turn record instead of a top-level
+`machineSnapshot` field.
+-}
+effectiveMachineSnapshot : SnapshotInternals -> Maybe Bytes
+effectiveMachineSnapshot snap =
+    case snap.machineSnapshot of
+        Just bytes ->
+            Just bytes
+
+        Nothing ->
+            List.foldl (\tr _ -> Just tr.snapshotBytes) Nothing snap.turnHistory
+
+
+{-| Encode a snapshot as a JSON value for persistence. Pair with
+`snapshotDecoder` to round-trip through any JSON-backed store.
+-}
+encodeSnapshot : SessionSnapshot -> E.Value
+encodeSnapshot (SessionSnapshot snap) =
+    E.object
+        [ ( "storyBytes", encodeBytes snap.storyBytes )
+        , ( "machineSnapshot", encodeMaybe encodeBytes snap.machineSnapshot )
+        , ( "transcript", E.list encodeFrame snap.transcript )
+        , ( "turnHistory", E.list encodeTurnRecord snap.turnHistory )
+        , ( "currentStatusLine", encodeMaybe encodeStatusLine snap.currentStatusLine )
+        , ( "storyName", E.string snap.storyName )
+        ]
+
+
+{-| Decode a snapshot produced by `encodeSnapshot`, with fallbacks for older
+shapes so pre-migration saves still load.
+-}
+snapshotDecoder : D.Decoder SessionSnapshot
+snapshotDecoder =
+    D.map SessionSnapshot
+        (D.map6 SnapshotInternals
+            (D.field "storyBytes" decodeBytes)
+            (D.oneOf
+                [ D.field "machineSnapshot" (D.nullable decodeBytes)
+                , D.field "currentSnapshot" (D.nullable decodeBytes)
+                , D.succeed Nothing
+                ]
+            )
+            (decoderOrDefault "transcript" (D.list decodeFrame) [])
+            (decoderOrDefault "turnHistory" (D.list decodeTurnRecord) [])
+            (decoderOrDefault "currentStatusLine" (D.nullable decodeStatusLine) Nothing)
+            (decoderOrDefault "storyName" D.string "")
+        )
+
+
+decoderOrDefault : String -> D.Decoder a -> a -> D.Decoder a
+decoderOrDefault fieldName decoder fallback =
+    D.oneOf [ D.field fieldName decoder, D.succeed fallback ]
+
+
+encodeBytes : Bytes -> E.Value
+encodeBytes bytes =
+    E.string (Base64.fromBytes bytes |> Maybe.withDefault "")
+
+
+decodeBytes : D.Decoder Bytes
+decodeBytes =
+    D.string
+        |> D.andThen
+            (\s ->
+                case Base64.toBytes s of
+                    Just bytes ->
+                        D.succeed bytes
+
+                    Nothing ->
+                        D.fail "Invalid base64"
+            )
+
+
+encodeMaybe : (a -> E.Value) -> Maybe a -> E.Value
+encodeMaybe encoder =
+    Maybe.map encoder >> Maybe.withDefault E.null
+
+
+encodeFrame : EngineTypes.Frame -> E.Value
+encodeFrame frame =
+    case frame of
+        EngineTypes.OutputFrame data ->
+            E.object
+                [ ( "type", E.string "output" )
+                , ( "text", E.string data.text )
+                , ( "statusLine", encodeMaybe encodeStatusLine data.statusLine )
+                ]
+
+        EngineTypes.InputFrame data ->
+            E.object
+                [ ( "type", E.string "input" )
+                , ( "command", E.string data.command )
+                ]
+
+
+decodeFrame : D.Decoder EngineTypes.Frame
+decodeFrame =
+    taggedUnion "type"
+        [ ( "output"
+          , D.map2 (\text sl -> EngineTypes.OutputFrame { text = text, statusLine = sl })
+                (D.field "text" D.string)
+                (D.field "statusLine" (D.nullable decodeStatusLine))
+          )
+        , ( "input"
+          , D.map (\cmd -> EngineTypes.InputFrame { command = cmd })
+                (D.field "command" D.string)
+          )
+        ]
+
+
+encodeTurnRecord : EngineTypes.TurnRecord -> E.Value
+encodeTurnRecord record =
+    E.object
+        [ ( "index", E.int record.index )
+        , ( "snapshotBytes", encodeBytes record.snapshotBytes )
+        , ( "locationId", E.int record.locationId )
+        , ( "locationName", E.string record.locationName )
+        , ( "moveInfo", encodeMoveInfo record.moveInfo )
+        , ( "transcriptLength", E.int record.transcriptLength )
+        ]
+
+
+decodeTurnRecord : D.Decoder EngineTypes.TurnRecord
+decodeTurnRecord =
+    D.oneOf
+        [ D.succeed EngineTypes.TurnRecord
+            |> andMap (D.field "index" D.int)
+            |> andMap (D.field "snapshotBytes" decodeBytes)
+            |> andMap (D.field "locationId" D.int)
+            |> andMap (D.field "locationName" D.string)
+            |> andMap (D.field "moveInfo" decodeMoveInfo)
+            |> andMap (D.field "transcriptLength" D.int)
+        , decodeLegacyTurnRecord
+        ]
+
+
+decodeLegacyTurnRecord : D.Decoder EngineTypes.TurnRecord
+decodeLegacyTurnRecord =
+    D.map5
+        (\idx snap _ locName tl ->
+            { index = idx
+            , snapshotBytes = snap
+            , locationId = 0
+            , locationName = locName
+            , moveInfo = EngineTypes.AtTurn 0
+            , transcriptLength = tl
+            }
+        )
+        (D.field "index" D.int)
+        (D.field "snapshotBytes" decodeBytes)
+        (D.field "command" D.string)
+        (D.field "locationName" D.string)
+        (D.field "transcriptLength" D.int)
+
+
+encodeMoveInfo : EngineTypes.MoveInfo -> E.Value
+encodeMoveInfo info =
+    case info of
+        EngineTypes.AtTurn n ->
+            E.object [ ( "type", E.string "turns" ), ( "turns", E.int n ) ]
+
+        EngineTypes.AtTime h m ->
+            E.object [ ( "type", E.string "time" ), ( "hours", E.int h ), ( "minutes", E.int m ) ]
+
+
+decodeMoveInfo : D.Decoder EngineTypes.MoveInfo
+decodeMoveInfo =
+    taggedUnion "type"
+        [ ( "turns", D.map EngineTypes.AtTurn (D.field "turns" D.int) )
+        , ( "time"
+          , D.map2 EngineTypes.AtTime
+                (D.field "hours" D.int)
+                (D.field "minutes" D.int)
+          )
+        ]
+
+
+encodeStatusLine : ZTypes.StatusLine -> E.Value
+encodeStatusLine sl =
+    E.object
+        [ ( "locationId", E.int sl.locationId )
+        , ( "locationName", E.string sl.locationName )
+        , ( "mode", encodeStatusLineMode sl.mode )
+        ]
+
+
+decodeStatusLine : D.Decoder ZTypes.StatusLine
+decodeStatusLine =
+    D.oneOf
+        [ D.map3 ZTypes.StatusLine
+            (D.field "locationId" D.int)
+            (D.field "locationName" D.string)
+            (D.field "mode" decodeStatusLineMode)
+        , decodeLegacyStatusLine
+        ]
+
+
+decodeLegacyStatusLine : D.Decoder ZTypes.StatusLine
+decodeLegacyStatusLine =
+    D.map4
+        (\name score turns isTime ->
+            { locationId = 0
+            , locationName = name
+            , mode =
+                if isTime then
+                    ZTypes.TimeOfDay score turns
+
+                else
+                    ZTypes.ScoreAndTurns score turns
+            }
+        )
+        (D.field "locationName" D.string)
+        (D.field "score" D.int)
+        (D.field "turns" D.int)
+        (D.field "isTimeGame" D.bool)
+
+
+encodeStatusLineMode : ZTypes.StatusLineMode -> E.Value
+encodeStatusLineMode mode =
+    case mode of
+        ZTypes.ScoreAndTurns score turns ->
+            E.object
+                [ ( "type", E.string "scoreAndTurns" )
+                , ( "score", E.int score )
+                , ( "turns", E.int turns )
+                ]
+
+        ZTypes.TimeOfDay hours minutes ->
+            E.object
+                [ ( "type", E.string "timeOfDay" )
+                , ( "hours", E.int hours )
+                , ( "minutes", E.int minutes )
+                ]
+
+        ZTypes.ScreenRows rows ->
+            E.object
+                [ ( "type", E.string "screenRows" )
+                , ( "rows", E.list E.string rows )
+                ]
+
+
+decodeStatusLineMode : D.Decoder ZTypes.StatusLineMode
+decodeStatusLineMode =
+    taggedUnion "type"
+        [ ( "scoreAndTurns"
+          , D.map2 ZTypes.ScoreAndTurns
+                (D.field "score" D.int)
+                (D.field "turns" D.int)
+          )
+        , ( "timeOfDay"
+          , D.map2 ZTypes.TimeOfDay
+                (D.field "hours" D.int)
+                (D.field "minutes" D.int)
+          )
+        , ( "screenRows"
+          , D.map ZTypes.ScreenRows
+                (D.field "rows" (D.list D.string))
+          )
+        ]
+
+
+taggedUnion : String -> List ( String, D.Decoder a ) -> D.Decoder a
+taggedUnion tagField cases =
+    D.field tagField D.string
+        |> D.andThen
+            (\tag ->
+                case List.filter (\( k, _ ) -> k == tag) cases of
+                    ( _, decoder ) :: _ ->
+                        decoder
+
+                    [] ->
+                        D.fail ("Unknown " ++ tagField ++ ": " ++ tag)
+            )
+
+
+andMap : D.Decoder a -> D.Decoder (a -> b) -> D.Decoder b
+andMap argDecoder funcDecoder =
+    D.map2 (\f a -> f a) funcDecoder argDecoder
 
 
 resumeFrom : TurnRecord -> Session -> Result Error ( Session, List Event, Cmd Msg )
