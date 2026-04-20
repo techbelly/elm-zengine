@@ -67,7 +67,6 @@ import ZEngine.Snapshot
 import ZEngine.Title
 import ZEngine.Types as EngineTypes exposing (TurnRecord, emptyPendingOutput)
 import ZMachine
-import ZMachine.Header
 import ZMachine.Snapshot
 import ZMachine.Types as ZTypes exposing (StepResult)
 
@@ -1481,21 +1480,21 @@ storyIdFromBytes bytes =
 
 storyIdFromMachine : ZMachine.ZMachine -> String
 storyIdFromMachine machine =
-    String.fromInt (ZMachine.Header.releaseNumber machine.memory)
+    String.fromInt (ZMachine.storyRelease machine)
         ++ "-"
-        ++ ZMachine.Header.serialNumber machine.memory
+        ++ ZMachine.storySerial machine
         ++ "-"
-        ++ String.fromInt (ZMachine.Header.checksum machine.memory)
+        ++ String.fromInt (ZMachine.storyChecksum machine)
 
 
 releaseNumber : Session -> Int
 releaseNumber (Session state) =
-    ZMachine.Header.releaseNumber state.machine.memory
+    ZMachine.storyRelease state.machine
 
 
 serialNumber : Session -> String
 serialNumber (Session state) =
-    ZMachine.Header.serialNumber state.machine.memory
+    ZMachine.storySerial state.machine
 
 
 storyBytes : Session -> Bytes
