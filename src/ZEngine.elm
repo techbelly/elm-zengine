@@ -48,10 +48,82 @@ module ZEngine exposing
     , formatMoveInfo
     )
 
-{-| Public surface for the elm-zengine library.
+{-| Session, transcript, and snapshot layer on top of
+[`techbelly/elm-zmachine`](https://package.elm-lang.org/packages/techbelly/elm-zmachine/latest).
 
-Readers are real; driver operations are still `Debug.todo`s and will be wired
-in subsequent commits. The app does not yet import this module.
+elm-zmachine gives you a pure Elm Z-Machine interpreter that you step
+forward instruction by instruction; that's the level of control a
+custom interpreter needs, but it's rarely what an application author
+wants. This library wraps the interpreter in a small TEA-style
+(`Model`, `Msg`, `update`) API:
+
+  - You hold a [`Session`](#Session) and pass [`Msg`](#Msg) values to
+    [`update`](#update).
+  - Each `update` returns a [`Step`](#Step), which tells you the new
+    session, what to render, and whether a `Cmd` needs to run (the
+    interpreter yields to the runtime between step batches so the page
+    stays responsive during long runs).
+  - Output arrives as a frame-structured [`transcript`](#transcript)
+    — one `OutputFrame` per prompt, one `InputFrame` per player
+    command — not a raw text stream.
+  - Save and restore flow through opaque [`SessionSnapshot`](#SessionSnapshot)
+    values that round-trip through JSON.
+
+The module re-exports everything you need; import it directly:
+
+    import ZEngine exposing (Session, Msg, Event(..))
+
+See the bundled tutorial, _Making a minimal interactive fiction
+player with ZEngine_, for a walking-skeleton app that pulls all of
+this together.
+
+
+# Sessions
+
+@docs Session, new, update
+
+
+# Driving the update loop
+
+@docs Msg, Step, apply, foldEvents, Event, Error, errorMessage
+
+
+# Sending input
+
+@docs sendLine, sendChar, sendSaveResult, sendRestore
+
+
+# Inspecting the session
+
+@docs phase, Phase, activePrompt, Prompt
+
+
+# Transcript
+
+@docs transcript, Frame, OutputFrameData, InputFrameData
+@docs statusLine, StatusLine, StatusLineMode
+
+
+# Turn history
+
+@docs turnHistory, TurnRecord, MoveInfo, formatMoveInfo
+
+
+# Saved state
+
+@docs SessionSnapshot, snapshot, encodeSnapshot, snapshotDecoder
+@docs restoreFrom, resumeFrom, snapshotBytes
+
+
+# Story identity
+
+@docs storyName, storyId, storyIdFromBytes
+@docs releaseNumber, serialNumber, storyBytes
+
+
+# Configuration
+
+@docs Config, defaultConfig, CharPolicy, SavePolicy, RestorePolicy
 
 -}
 
@@ -71,6 +143,11 @@ import ZMachine.Snapshot
 import ZMachine.Types as ZTypes exposing (StepResult)
 
 
+{-| An opaque running session: the Z-Machine, its transcript, turn
+history, current status line, and queued input. Store one in your
+`Model`; all engine operations take a `Session` and return a
+[`Step`](#Step) containing the next `Session`.
+-}
 type Session
     = Session InternalState
 
@@ -92,27 +169,48 @@ type alias InternalState =
     }
 
 
+{-| Internal engine messages. Wrap in your own `Msg` type with a
+tagger: every engine call accepts `(Msg -> msg)` as its first
+argument so commands come back already mapped.
+-}
 type Msg
     = Yielded
     | StepCompleted StepResult
 
 
+{-| A single entry in the session transcript: either text the game
+printed ([`OutputFrame`](#OutputFrameData)) or a command the player
+sent ([`InputFrame`](#InputFrameData)).
+-}
 type Frame
     = OutputFrame OutputFrameData
     | InputFrame InputFrameData
 
 
+{-| Contents of an `OutputFrame`: the full text rendered during this
+turn (with embedded `\n` line breaks) and the status line that was
+current when the frame was flushed (`Nothing` for pre-status-line
+output such as the banner).
+-}
 type alias OutputFrameData =
     { text : String
     , statusLine : Maybe StatusLine
     }
 
 
+{-| Contents of an `InputFrame`: the command string the player
+submitted, already truncated to the Z-Machine's advertised max length.
+-}
 type alias InputFrameData =
     { command : String
     }
 
 
+{-| The status line shown at the top of the game. Values are derived
+from the underlying Z-Machine [`StatusLine`](ZMachine-Types#StatusLine)
+— see [`StatusLineMode`](#StatusLineMode) for the version-dependent
+right-hand content.
+-}
 type alias StatusLine =
     { locationId : Int
     , locationName : String
@@ -120,12 +218,34 @@ type alias StatusLine =
     }
 
 
+{-| Version-dependent payload of the status line:
+
+  - `ScoreAndTurns score turns` — V3 score-based game.
+  - `TimeOfDay hours minutes` — V3 time-based game (0–23, 0–59).
+  - `ScreenRows rows` — V5+ game that draws its own upper window;
+    one string per rendered row, already trimmed.
+
+-}
 type StatusLineMode
     = ScoreAndTurns Int Int
     | TimeOfDay Int Int
     | ScreenRows (List String)
 
 
+{-| What the engine is currently waiting for when you receive a
+`PromptIssued` event:
+
+  - `LinePrompt` — a line of input; respond with [`sendLine`](#sendLine).
+  - `CharPrompt` — a single character; respond with [`sendChar`](#sendChar).
+  - `SavePrompt bytes` — an in-game `save`; persist `bytes` and call
+    [`sendSaveResult`](#sendSaveResult).
+  - `RestorePrompt` — an in-game `restore`; call
+    [`sendRestore`](#sendRestore) with previously-persisted bytes.
+
+The non-line variants only surface if the session [`Config`](#Config)
+asks for them; the defaults auto-handle char/save/restore.
+
+-}
 type Prompt
     = LinePrompt
     | CharPrompt
@@ -144,16 +264,41 @@ type alias Config =
     }
 
 
+{-| How to respond when the story asks for a single keypress
+(`read_char`).
+
+  - `AutoChar c` — answer internally with character `c` and keep
+    running.
+  - `SurfaceChar` — emit `PromptIssued CharPrompt` so the consumer
+    can prompt the player and call [`sendChar`](#sendChar).
+
+-}
 type CharPolicy
     = AutoChar Char
     | SurfaceChar
 
 
+{-| How to respond when the story executes the `save` opcode.
+
+  - `DeclineSave` — report failure; the story's save-branch-on-failure
+    is taken. Good default for linear play.
+  - `SurfaceSave` — emit `PromptIssued (SavePrompt bytes)` carrying the
+    snapshot bytes to persist; resume with [`sendSaveResult`](#sendSaveResult).
+
+-}
 type SavePolicy
     = DeclineSave
     | SurfaceSave
 
 
+{-| How to respond when the story executes the `restore` opcode.
+
+  - `DeclineRestore` — report failure; execution continues past the
+    restore instruction.
+  - `SurfaceRestore` — emit `PromptIssued RestorePrompt` so the
+    consumer can pick a saved snapshot and call [`sendRestore`](#sendRestore).
+
+-}
 type RestorePolicy
     = DeclineRestore
     | SurfaceRestore
@@ -170,6 +315,18 @@ defaultConfig =
     }
 
 
+{-| One rewind point in the turn history. Captured automatically
+when the player enters a room the engine hasn't seen before, so
+[`resumeFrom`](#resumeFrom) can jump back to any past location.
+
+  - `index` — monotonic counter, stable for the session.
+  - `snapshotBytes` — Z-Machine snapshot bytes for the turn.
+  - `locationId` / `locationName` — the room at that point.
+  - `moveInfo` — turn counter or time, depending on the story.
+  - `transcriptLength` — how much of the transcript belongs to this
+    turn; used to trim on rewind.
+
+-}
 type alias TurnRecord =
     { index : Int
     , snapshotBytes : Bytes
@@ -180,11 +337,32 @@ type alias TurnRecord =
     }
 
 
+{-| Move counter for a turn. V3 stories are either score games
+(`AtTurn`) or time games (`AtTime hours minutes`). Format for display
+with [`formatMoveInfo`](#formatMoveInfo).
+-}
 type MoveInfo
     = AtTurn Int
     | AtTime Int Int
 
 
+{-| Observations emitted during an `update`/`send` call, returned in
+`step.events`. Handle the ones you care about and ignore the rest:
+
+  - `OutputProduced frame` — a new transcript frame was added.
+    Append to your rendered transcript.
+  - `PromptIssued prompt` — the story is blocked waiting for the
+    consumer; show a prompt and eventually call the matching
+    `send…` function.
+  - `StatusLineChanged status` — the status line changed. Useful
+    for keeping a sticky header in sync without re-reading
+    `statusLine` every render.
+  - `TurnCompleted` — a full player turn just resolved.
+  - `TitleDetected title` — the engine sniffed a game title from
+    banner output. Emitted at most once per session.
+  - `GameOver` — the story halted cleanly (the player quit).
+
+-}
 type Event
     = OutputProduced Frame
     | PromptIssued Prompt
@@ -194,6 +372,20 @@ type Event
     | GameOver
 
 
+{-| A session-level failure. Paired with a `Step` whose `session`
+is `Nothing` (load/restore) or a terminal session (runtime).
+
+  - `LoadError` — the story bytes couldn't be parsed as a Z-Machine
+    story file, or the version isn't supported.
+  - `RestoreError` — a snapshot couldn't be applied to the story
+    (wrong story, corrupt data).
+  - `RuntimeError` — the interpreter halted with an error. The
+    returned session is terminal but still useful for rendering the
+    final transcript.
+
+Use [`errorMessage`](#errorMessage) if you just want the string.
+
+-}
 type Error
     = LoadError String
     | RestoreError String
@@ -290,6 +482,18 @@ apply merge model step =
     ( merge step.session step.error model, step.cmd )
 
 
+{-| The session's lifecycle state. Most UIs only need to distinguish
+`Waiting` (show a prompt) from everything else (show a spinner or
+nothing), but the full set is available for richer rendering.
+
+  - `Loading` — `new` / `restoreFrom` kicked off but hasn't yielded yet.
+  - `Running` — the interpreter is mid-turn.
+  - `Waiting prompt` — blocked on the consumer; see [`Prompt`](#Prompt).
+  - `Halted` — the story quit cleanly.
+  - `Errored message` — the interpreter reported a runtime error;
+    the session is terminal.
+
+-}
 type Phase
     = Loading
     | Running
@@ -298,6 +502,8 @@ type Phase
     | Errored String
 
 
+{-| The session's current [`Phase`](#Phase).
+-}
 phase : Session -> Phase
 phase (Session state) =
     case state.phase of
@@ -317,6 +523,10 @@ phase (Session state) =
             Errored message
 
 
+{-| The current [`Prompt`](#Prompt), or `Nothing` if the session isn't
+waiting on the consumer. Equivalent to `phase >> toPrompt`, but a
+direct accessor is usually enough.
+-}
 activePrompt : Session -> Maybe Prompt
 activePrompt (Session state) =
     Maybe.map (\_ -> promptFromInternal state) state.activePrompt
@@ -341,6 +551,25 @@ promptFromInternal state =
             LinePrompt
 
 
+{-| Start a new session from raw story-file bytes. The returned
+`Step` carries the initial `Session` and a yield `Cmd` that kicks off
+execution; return the cmd from your `update` and the engine will
+start stepping through the prologue.
+
+    init : Bytes -> ( Model, Cmd Msg )
+    init storyBytes =
+        let
+            step =
+                ZEngine.new EngineMsg ZEngine.defaultConfig storyBytes
+        in
+        ( { session = step.session, error = Maybe.map ZEngine.errorMessage step.error }
+        , step.cmd
+        )
+
+On load failure, `step.session` is `Nothing` and `step.error` is
+`Just (LoadError _)`.
+
+-}
 new : (Msg -> msg) -> Config -> Bytes -> Step msg
 new tagger config bytes =
     (case ZMachine.load bytes of
@@ -382,6 +611,27 @@ stepBudget =
     100000
 
 
+{-| Advance the session in response to an engine `Msg`. This is what
+you call from your own `update` whenever you receive a tagged engine
+message:
+
+    update : Msg -> Model -> ( Model, Cmd Msg )
+    update msg model =
+        case msg of
+            EngineMsg engineMsg ->
+                case model.session of
+                    Just session ->
+                        ZEngine.update EngineMsg engineMsg session
+                            |> ZEngine.apply mergeEngine model
+
+                    Nothing ->
+                        ( model, Cmd.none )
+
+The engine yields to the runtime between step batches, so long runs
+don't block the UI — just keep piping the returned `Cmd` back into
+your `update`.
+
+-}
 update : (Msg -> msg) -> Msg -> Session -> Step msg
 update tagger msg (Session state) =
     (case msg of
@@ -1404,6 +1654,20 @@ andMap argDecoder funcDecoder =
     D.map2 (\f a -> f a) funcDecoder argDecoder
 
 
+{-| Rewind the session to a past `TurnRecord` captured in
+[`turnHistory`](#turnHistory). Trims the transcript and history back
+to that point and resumes the interpreter from the recorded machine
+snapshot.
+
+    case List.head (ZEngine.turnHistory session) of
+        Just earliest ->
+            ZEngine.resumeFrom EngineMsg earliest session
+
+        Nothing ->
+            -- no prior turns recorded yet
+            ...
+
+-}
 resumeFrom : (Msg -> msg) -> TurnRecord -> Session -> Step msg
 resumeFrom tagger publicRecord (Session state) =
     let
@@ -1443,31 +1707,55 @@ resumeFrom tagger publicRecord (Session state) =
         |> mapStep tagger
 
 
+{-| The session's transcript as a flat list of frames in play order.
+Use for rendering; prefer subscribing to `OutputProduced` events if
+you want to react to each turn as it arrives.
+-}
 transcript : Session -> List Frame
 transcript (Session state) =
     List.map toPublicFrame state.transcript
 
 
+{-| The most recent status line, or `Nothing` if the game hasn't
+produced one yet. Mirrors the value carried inside the last
+`OutputFrame`.
+-}
 statusLine : Session -> Maybe StatusLine
 statusLine (Session state) =
     Maybe.map toPublicStatusLine state.currentStatusLine
 
 
+{-| Rewind points recorded as the player visited new locations. Pass
+one back to [`resumeFrom`](#resumeFrom) to jump the session to that
+point in history.
+-}
 turnHistory : Session -> List TurnRecord
 turnHistory (Session state) =
     List.map toPublicTurnRecord state.turnHistory
 
 
+{-| The game's detected title, or `""` until it's been sniffed from
+the banner. Clients usually listen for the `TitleDetected` event and
+remember the value themselves; this accessor is a convenience.
+-}
 storyName : Session -> String
 storyName (Session state) =
     state.storyName
 
 
+{-| A stable identifier for the story file backing this session —
+release, serial, and checksum joined with dashes. Useful as a key in
+per-story stores (autosaves, bookmarks, preferences).
+-}
 storyId : Session -> String
 storyId (Session state) =
     storyIdFromMachine state.machine
 
 
+{-| Compute [`storyId`](#storyId) directly from raw bytes without
+constructing a session. Returns `Nothing` if the bytes aren't a
+valid story file.
+-}
 storyIdFromBytes : Bytes -> Maybe String
 storyIdFromBytes bytes =
     case ZMachine.load bytes of
@@ -1487,21 +1775,36 @@ storyIdFromMachine machine =
         ++ String.fromInt (ZMachine.storyChecksum machine)
 
 
+{-| The story file's release number (header word 0x02).
+-}
 releaseNumber : Session -> Int
 releaseNumber (Session state) =
     ZMachine.storyRelease state.machine
 
 
+{-| The story file's serial number — six ASCII bytes at header 0x12.
+Usually a `YYMMDD` build date for Infocom stories.
+-}
 serialNumber : Session -> String
 serialNumber (Session state) =
     ZMachine.storySerial state.machine
 
 
+{-| The raw story bytes this session was loaded from. Handy when you
+want to re-seed a fresh session or hand the bytes off elsewhere
+without re-reading from disk.
+-}
 storyBytes : Session -> Bytes
 storyBytes (Session state) =
     state.storyBytes
 
 
+{-| Encode just the Z-Machine machine state as bytes. Lighter than
+[`snapshot`](#snapshot) — no transcript, no turn history — and
+compatible with
+[`ZMachine.Snapshot.decode`](ZMachine-Snapshot#decode) for clients
+that want to round-trip machine state only.
+-}
 snapshotBytes : Session -> Bytes
 snapshotBytes (Session state) =
     ZEngine.Snapshot.encode state.machine
@@ -1526,6 +1829,10 @@ foldEvents handler events seed =
         events
 
 
+{-| Format a [`MoveInfo`](#MoveInfo) for display. `AtTurn 0` renders
+as `"Start"`; other turns render as `"Turn N"`; times render as
+`"H:MM"`.
+-}
 formatMoveInfo : MoveInfo -> String
 formatMoveInfo info =
     case info of
