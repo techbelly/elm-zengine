@@ -31,6 +31,7 @@ module ZEngine exposing
     , snapshotDecoder
     , restoreFrom
     , resumeFrom
+    , apply
     , foldEvents
     , transcript
     , statusLine
@@ -224,38 +225,70 @@ etc.). One uniform shape covers both success and failure:
     can keep rendering the transcript. It's `Nothing` only when the machine
     couldn't load or restore at all.
   - `events` is the list of things the library observed during the step.
-  - `cmd` is the next `ZEngine.Msg`-bearing command; clients wire it into
-    their own update loop with `Cmd.map`.
+  - `cmd` is the next command the client should return from their `update`.
+    Every session-advancing call takes a `(Msg -> msg)` tagger as its first
+    argument and the command comes out already wrapped, so clients never need
+    `Cmd.map` at the call site.
   - `error` is `Just` iff something went wrong. Pair with `errorMessage` for
     a display string.
 
 -}
-type alias Step =
+type alias Step msg =
     { session : Maybe Session
     , events : List Event
-    , cmd : Cmd Msg
+    , cmd : Cmd msg
     , error : Maybe Error
     }
 
 
-okStep : Session -> List Event -> Cmd Msg -> Step
+okStep : Session -> List Event -> Cmd Msg -> Step Msg
 okStep session events cmd =
     { session = Just session, events = events, cmd = cmd, error = Nothing }
 
 
-loadFailed : String -> Step
+loadFailed : String -> Step Msg
 loadFailed message =
     { session = Nothing, events = [], cmd = Cmd.none, error = Just (LoadError message) }
 
 
-restoreFailed : String -> Step
+restoreFailed : String -> Step Msg
 restoreFailed message =
     { session = Nothing, events = [], cmd = Cmd.none, error = Just (RestoreError message) }
 
 
-runtimeErrored : Session -> List Event -> String -> Step
+runtimeErrored : Session -> List Event -> String -> Step Msg
 runtimeErrored session events message =
     { session = Just session, events = events, cmd = Cmd.none, error = Just (RuntimeError message) }
+
+
+mapStep : (Msg -> msg) -> Step Msg -> Step msg
+mapStep tagger step =
+    { session = step.session
+    , events = step.events
+    , cmd = Cmd.map tagger step.cmd
+    , error = step.error
+    }
+
+
+{-| Fold a `Step` into your model in one call. `merge` is yours — it's how
+you copy the engine's session (and any error) into your own `Model`. The
+helper takes care of wrapping `step.cmd` into your `update` return tuple.
+Designed to pipe:
+
+    mergeEngine : Maybe ZEngine.Session -> Maybe ZEngine.Error -> Model -> Model
+    mergeEngine session error model =
+        { model
+            | session = session
+            , error = Maybe.map ZEngine.errorMessage error
+        }
+
+    ZEngine.sendLine EngineMsg command session
+        |> ZEngine.apply mergeEngine model
+
+-}
+apply : (Maybe Session -> Maybe Error -> m -> m) -> m -> Step msg -> ( m, Cmd msg )
+apply merge model step =
+    ( merge step.session step.error model, step.cmd )
 
 
 type Phase
@@ -309,14 +342,16 @@ promptFromInternal state =
             LinePrompt
 
 
-new : Config -> Bytes -> Step
-new config bytes =
-    case ZMachine.load bytes of
+new : (Msg -> msg) -> Config -> Bytes -> Step msg
+new tagger config bytes =
+    (case ZMachine.load bytes of
         Err err ->
             loadFailed err
 
         Ok machine ->
             okStep (Session (initialState config machine bytes)) [] yieldCmd
+    )
+        |> mapStep tagger
 
 
 initialState : Config -> ZMachine.ZMachine -> Bytes -> InternalState
@@ -348,17 +383,19 @@ stepBudget =
     100000
 
 
-update : Msg -> Session -> Step
-update msg (Session state) =
-    case msg of
+update : (Msg -> msg) -> Msg -> Session -> Step msg
+update tagger msg (Session state) =
+    (case msg of
         Yielded ->
             dispatch (ZMachine.runSteps stepBudget state.machine) state
 
         StepCompleted result ->
             dispatch result state
+    )
+        |> mapStep tagger
 
 
-dispatch : StepResult -> InternalState -> Step
+dispatch : StepResult -> InternalState -> Step Msg
 dispatch result state =
     case result of
         ZTypes.Continue events machine ->
@@ -457,7 +494,7 @@ dispatch result state =
                 message
 
 
-okFromTriple : ( Session, List Event, Cmd Msg ) -> Step
+okFromTriple : ( Session, List Event, Cmd Msg ) -> Step Msg
 okFromTriple ( session, events, cmd ) =
     okStep session events cmd
 
@@ -860,14 +897,14 @@ phase: if the engine isn't currently waiting for a line, the input is queued
 and drained at the next line prompt. Input longer than the Z-Machine's
 advertised max length is truncated on the way in.
 -}
-sendLine : String -> Session -> Step
-sendLine input (Session state) =
+sendLine : (Msg -> msg) -> String -> Session -> Step msg
+sendLine tagger input (Session state) =
     let
         command : String
         command =
             stripTrailingNewline input
     in
-    case ( state.phase, state.activePrompt ) of
+    (case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just (Internal.LineActive req) ) ->
             let
                 truncated : String
@@ -901,14 +938,16 @@ sendLine input (Session state) =
 
         _ ->
             okStep (Session state) [] Cmd.none
+    )
+        |> mapStep tagger
 
 
 {-| Respond to a char prompt (`read_char`). No-op if the engine isn't
 waiting for a single character.
 -}
-sendChar : Char -> Session -> Step
-sendChar c (Session state) =
-    case ( state.phase, state.activePrompt ) of
+sendChar : (Msg -> msg) -> Char -> Session -> Step msg
+sendChar tagger c (Session state) =
+    (case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.CharActive ) ->
             let
                 newState : InternalState
@@ -924,6 +963,8 @@ sendChar c (Session state) =
 
         _ ->
             okStep (Session state) [] Cmd.none
+    )
+        |> mapStep tagger
 
 
 {-| Respond to an in-game save prompt. Pass `True` if the consumer has
@@ -931,9 +972,9 @@ persisted the save bytes (from the `SavePrompt Bytes` variant), `False` on
 failure or when the consumer declines. No-op if the engine isn't waiting for
 a save result.
 -}
-sendSaveResult : Bool -> Session -> Step
-sendSaveResult saveOk (Session state) =
-    case ( state.phase, state.activePrompt ) of
+sendSaveResult : (Msg -> msg) -> Bool -> Session -> Step msg
+sendSaveResult tagger saveOk (Session state) =
+    (case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just (Internal.SaveActive _) ) ->
             let
                 newState : InternalState
@@ -949,15 +990,17 @@ sendSaveResult saveOk (Session state) =
 
         _ ->
             okStep (Session state) [] Cmd.none
+    )
+        |> mapStep tagger
 
 
 {-| Respond to an in-game restore prompt. Pass `Just bytes` to restore from
 a previously-saved snapshot (produced by `SavePrompt`), `Nothing` to decline.
 No-op if the engine isn't waiting for a restore.
 -}
-sendRestore : Maybe Bytes -> Session -> Step
-sendRestore maybeBytes (Session state) =
-    case ( state.phase, state.activePrompt ) of
+sendRestore : (Msg -> msg) -> Maybe Bytes -> Session -> Step msg
+sendRestore tagger maybeBytes (Session state) =
+    (case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.RestoreActive ) ->
             let
                 newState : InternalState
@@ -986,6 +1029,8 @@ sendRestore maybeBytes (Session state) =
 
         _ ->
             okStep (Session state) [] Cmd.none
+    )
+        |> mapStep tagger
 
 
 stripTrailingNewline : String -> String
@@ -1038,9 +1083,9 @@ snapshot (Session state) =
 lacks a machine snapshot (legacy saves that predate snapshot capture), falls
 back to starting a fresh session from the story bytes.
 -}
-restoreFrom : Config -> SessionSnapshot -> Step
-restoreFrom config (SessionSnapshot snap) =
-    case ZMachine.load snap.storyBytes of
+restoreFrom : (Msg -> msg) -> Config -> SessionSnapshot -> Step msg
+restoreFrom tagger config (SessionSnapshot snap) =
+    (case ZMachine.load snap.storyBytes of
         Err err ->
             loadFailed err
 
@@ -1074,6 +1119,8 @@ restoreFrom config (SessionSnapshot snap) =
                                 )
                                 []
                                 yieldCmd
+    )
+        |> mapStep tagger
 
 
 {-| Pick the best available machine snapshot: the one captured at save time
@@ -1358,14 +1405,14 @@ andMap argDecoder funcDecoder =
     D.map2 (\f a -> f a) funcDecoder argDecoder
 
 
-resumeFrom : TurnRecord -> Session -> Step
-resumeFrom publicRecord (Session state) =
+resumeFrom : (Msg -> msg) -> TurnRecord -> Session -> Step msg
+resumeFrom tagger publicRecord (Session state) =
     let
         record : EngineTypes.TurnRecord
         record =
             fromPublicTurnRecord publicRecord
     in
-    case ZEngine.Snapshot.restore record.snapshotBytes state.machine of
+    (case ZEngine.Snapshot.restore record.snapshotBytes state.machine of
         Err message ->
             restoreFailed message
 
@@ -1393,6 +1440,8 @@ resumeFrom publicRecord (Session state) =
                     }
             in
             okStep (Session newState) [] yieldCmd
+    )
+        |> mapStep tagger
 
 
 transcript : Session -> List Frame
