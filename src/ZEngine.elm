@@ -3,7 +3,8 @@ module ZEngine exposing
     , Msg
     , Event(..)
     , Error(..)
-    , RuntimeErrorData
+    , errorMessage
+    , Step
     , Frame(..)
     , OutputFrameData
     , InputFrameData
@@ -196,14 +197,65 @@ type Event
 type Error
     = LoadError String
     | RestoreError String
-    | RuntimeError RuntimeErrorData
+    | RuntimeError String
 
 
-type alias RuntimeErrorData =
-    { session : Session
+{-| Extract the human-readable message from an `Error`, regardless of
+variant. Saves clients writing their own case-on-Error-to-string helper.
+-}
+errorMessage : Error -> String
+errorMessage err =
+    case err of
+        LoadError msg ->
+            msg
+
+        RestoreError msg ->
+            msg
+
+        RuntimeError msg ->
+            msg
+
+
+{-| The result of any session-advancing call (`new`, `update`, `sendLine`,
+etc.). One uniform shape covers both success and failure:
+
+  - `session` is `Just` whenever the caller has a usable session to store —
+    including runtime errors, where it holds the terminal state so the client
+    can keep rendering the transcript. It's `Nothing` only when the machine
+    couldn't load or restore at all.
+  - `events` is the list of things the library observed during the step.
+  - `cmd` is the next `ZEngine.Msg`-bearing command; clients wire it into
+    their own update loop with `Cmd.map`.
+  - `error` is `Just` iff something went wrong. Pair with `errorMessage` for
+    a display string.
+
+-}
+type alias Step =
+    { session : Maybe Session
     , events : List Event
-    , message : String
+    , cmd : Cmd Msg
+    , error : Maybe Error
     }
+
+
+okStep : Session -> List Event -> Cmd Msg -> Step
+okStep session events cmd =
+    { session = Just session, events = events, cmd = cmd, error = Nothing }
+
+
+loadFailed : String -> Step
+loadFailed message =
+    { session = Nothing, events = [], cmd = Cmd.none, error = Just (LoadError message) }
+
+
+restoreFailed : String -> Step
+restoreFailed message =
+    { session = Nothing, events = [], cmd = Cmd.none, error = Just (RestoreError message) }
+
+
+runtimeErrored : Session -> List Event -> String -> Step
+runtimeErrored session events message =
+    { session = Just session, events = events, cmd = Cmd.none, error = Just (RuntimeError message) }
 
 
 type Phase
@@ -257,18 +309,14 @@ promptFromInternal state =
             LinePrompt
 
 
-new : Config -> Bytes -> Result Error ( Session, List Event, Cmd Msg )
+new : Config -> Bytes -> Step
 new config bytes =
     case ZMachine.load bytes of
         Err err ->
-            Err (LoadError err)
+            loadFailed err
 
         Ok machine ->
-            Ok
-                ( Session (initialState config machine bytes)
-                , []
-                , yieldCmd
-                )
+            okStep (Session (initialState config machine bytes)) [] yieldCmd
 
 
 initialState : Config -> ZMachine.ZMachine -> Bytes -> InternalState
@@ -300,7 +348,7 @@ stepBudget =
     100000
 
 
-update : Msg -> Session -> Result Error ( Session, List Event, Cmd Msg )
+update : Msg -> Session -> Step
 update msg (Session state) =
     case msg of
         Yielded ->
@@ -310,31 +358,31 @@ update msg (Session state) =
             dispatch result state
 
 
-dispatch : StepResult -> InternalState -> Result Error ( Session, List Event, Cmd Msg )
+dispatch : StepResult -> InternalState -> Step
 dispatch result state =
     case result of
         ZTypes.Continue events machine ->
-            Ok
-                ( Session
+            okStep
+                (Session
                     { state
                         | machine = machine
                         , phase = Internal.Running
                         , pendingOutput = ZEngine.Output.processEvents events state.pendingOutput
                     }
-                , []
-                , yieldCmd
                 )
+                []
+                yieldCmd
 
         ZTypes.NeedInput req events machine ->
-            Ok (onLinePrompt req events machine state)
+            okFromTriple (onLinePrompt req events machine state)
 
         ZTypes.NeedChar events machine ->
             case state.config.onCharPrompt of
                 SurfaceChar ->
-                    Ok (onNonLinePrompt Internal.CharActive CharPrompt events machine state)
+                    okFromTriple (onNonLinePrompt Internal.CharActive CharPrompt events machine state)
 
                 AutoChar c ->
-                    Ok (onAutoRespondPrompt (ZMachine.provideChar (String.fromChar c)) events machine state)
+                    okFromTriple (onAutoRespondPrompt (ZMachine.provideChar (String.fromChar c)) events machine state)
 
         ZTypes.NeedSave machineSnapshot events machine ->
             case state.config.onSavePrompt of
@@ -344,18 +392,18 @@ dispatch result state =
                         saveBytes =
                             ZMachine.Snapshot.encode state.machine.originalMemory machineSnapshot
                     in
-                    Ok (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
+                    okFromTriple (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
 
                 DeclineSave ->
-                    Ok (onAutoRespondPrompt (ZMachine.provideSaveResult False) events machine state)
+                    okFromTriple (onAutoRespondPrompt (ZMachine.provideSaveResult False) events machine state)
 
         ZTypes.NeedRestore events machine ->
             case state.config.onRestorePrompt of
                 SurfaceRestore ->
-                    Ok (onNonLinePrompt Internal.RestoreActive RestorePrompt events machine state)
+                    okFromTriple (onNonLinePrompt Internal.RestoreActive RestorePrompt events machine state)
 
                 DeclineRestore ->
-                    Ok (onAutoRespondPrompt (ZMachine.provideRestoreResult Nothing) events machine state)
+                    okFromTriple (onAutoRespondPrompt (ZMachine.provideRestoreResult Nothing) events machine state)
 
         ZTypes.Halted events machine ->
             let
@@ -367,17 +415,17 @@ dispatch result state =
                 newTranscript =
                     state.transcript ++ [ EngineTypes.OutputFrame finalOutput ]
             in
-            Ok
-                ( Session
+            okStep
+                (Session
                     { state
                         | machine = machine
                         , phase = Internal.Halted
                         , transcript = newTranscript
                         , pendingOutput = emptyPendingOutput
                     }
-                , [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)), GameOver ]
-                , Cmd.none
                 )
+                [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)), GameOver ]
+                Cmd.none
 
         ZTypes.Error err events machine ->
             let
@@ -403,13 +451,15 @@ dispatch result state =
                             , pendingOutput = emptyPendingOutput
                         }
             in
-            Err
-                (RuntimeError
-                    { session = erroredSession
-                    , events = [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)) ]
-                    , message = message
-                    }
-                )
+            runtimeErrored
+                erroredSession
+                [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)) ]
+                message
+
+
+okFromTriple : ( Session, List Event, Cmd Msg ) -> Step
+okFromTriple ( session, events, cmd ) =
+    okStep session events cmd
 
 
 onLinePrompt : ZTypes.LineInputInfo -> List ZTypes.OutputEvent -> ZMachine.ZMachine -> InternalState -> ( Session, List Event, Cmd Msg )
@@ -810,7 +860,7 @@ phase: if the engine isn't currently waiting for a line, the input is queued
 and drained at the next line prompt. Input longer than the Z-Machine's
 advertised max length is truncated on the way in.
 -}
-sendLine : String -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendLine : String -> Session -> Step
 sendLine input (Session state) =
     let
         command : String
@@ -836,27 +886,27 @@ sendLine input (Session state) =
                         , phase = Internal.Running
                     }
             in
-            Ok
-                ( Session newState
-                , []
-                , Task.succeed ()
+            okStep
+                (Session newState)
+                []
+                (Task.succeed ()
                     |> Task.perform (\_ -> StepCompleted (ZMachine.provideInput truncated req state.machine))
                 )
 
         ( Internal.Loading, _ ) ->
-            Ok ( Session { state | inputQueue = state.inputQueue ++ [ command ] }, [], Cmd.none )
+            okStep (Session { state | inputQueue = state.inputQueue ++ [ command ] }) [] Cmd.none
 
         ( Internal.Running, _ ) ->
-            Ok ( Session { state | inputQueue = state.inputQueue ++ [ command ] }, [], Cmd.none )
+            okStep (Session { state | inputQueue = state.inputQueue ++ [ command ] }) [] Cmd.none
 
         _ ->
-            Ok ( Session state, [], Cmd.none )
+            okStep (Session state) [] Cmd.none
 
 
 {-| Respond to a char prompt (`read_char`). No-op if the engine isn't
 waiting for a single character.
 -}
-sendChar : Char -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendChar : Char -> Session -> Step
 sendChar c (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.CharActive ) ->
@@ -865,15 +915,15 @@ sendChar c (Session state) =
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
-            Ok
-                ( Session newState
-                , []
-                , Task.succeed ()
+            okStep
+                (Session newState)
+                []
+                (Task.succeed ()
                     |> Task.perform (\_ -> StepCompleted (ZMachine.provideChar (String.fromChar c) state.machine))
                 )
 
         _ ->
-            Ok ( Session state, [], Cmd.none )
+            okStep (Session state) [] Cmd.none
 
 
 {-| Respond to an in-game save prompt. Pass `True` if the consumer has
@@ -881,8 +931,8 @@ persisted the save bytes (from the `SavePrompt Bytes` variant), `False` on
 failure or when the consumer declines. No-op if the engine isn't waiting for
 a save result.
 -}
-sendSaveResult : Bool -> Session -> Result Error ( Session, List Event, Cmd Msg )
-sendSaveResult ok (Session state) =
+sendSaveResult : Bool -> Session -> Step
+sendSaveResult saveOk (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just (Internal.SaveActive _) ) ->
             let
@@ -890,22 +940,22 @@ sendSaveResult ok (Session state) =
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
-            Ok
-                ( Session newState
-                , []
-                , Task.succeed ()
-                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideSaveResult ok state.machine))
+            okStep
+                (Session newState)
+                []
+                (Task.succeed ()
+                    |> Task.perform (\_ -> StepCompleted (ZMachine.provideSaveResult saveOk state.machine))
                 )
 
         _ ->
-            Ok ( Session state, [], Cmd.none )
+            okStep (Session state) [] Cmd.none
 
 
 {-| Respond to an in-game restore prompt. Pass `Just bytes` to restore from
 a previously-saved snapshot (produced by `SavePrompt`), `Nothing` to decline.
 No-op if the engine isn't waiting for a restore.
 -}
-sendRestore : Maybe Bytes -> Session -> Result Error ( Session, List Event, Cmd Msg )
+sendRestore : Maybe Bytes -> Session -> Step
 sendRestore maybeBytes (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.RestoreActive ) ->
@@ -914,10 +964,10 @@ sendRestore maybeBytes (Session state) =
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
-            Ok
-                ( Session newState
-                , []
-                , Task.succeed ()
+            okStep
+                (Session newState)
+                []
+                (Task.succeed ()
                     |> Task.perform
                         (\_ ->
                             let
@@ -935,7 +985,7 @@ sendRestore maybeBytes (Session state) =
                 )
 
         _ ->
-            Ok ( Session state, [], Cmd.none )
+            okStep (Session state) [] Cmd.none
 
 
 stripTrailingNewline : String -> String
@@ -988,25 +1038,21 @@ snapshot (Session state) =
 lacks a machine snapshot (legacy saves that predate snapshot capture), falls
 back to starting a fresh session from the story bytes.
 -}
-restoreFrom : Config -> SessionSnapshot -> Result Error ( Session, List Event, Cmd Msg )
+restoreFrom : Config -> SessionSnapshot -> Step
 restoreFrom config (SessionSnapshot snap) =
     case ZMachine.load snap.storyBytes of
         Err err ->
-            Err (LoadError err)
+            loadFailed err
 
         Ok freshMachine ->
             case effectiveMachineSnapshot snap of
                 Nothing ->
-                    Ok
-                        ( Session (initialState config freshMachine snap.storyBytes)
-                        , []
-                        , yieldCmd
-                        )
+                    okStep (Session (initialState config freshMachine snap.storyBytes)) [] yieldCmd
 
                 Just machineSnapshot ->
                     case ZEngine.Snapshot.restore machineSnapshot freshMachine of
                         Err message ->
-                            Err (RestoreError message)
+                            restoreFailed message
 
                         Ok restoredMachine ->
                             let
@@ -1014,8 +1060,8 @@ restoreFrom config (SessionSnapshot snap) =
                                 base =
                                     initialState config restoredMachine snap.storyBytes
                             in
-                            Ok
-                                ( Session
+                            okStep
+                                (Session
                                     { base
                                         | restoringSession = True
                                         , phase = Internal.Running
@@ -1025,9 +1071,9 @@ restoreFrom config (SessionSnapshot snap) =
                                         , storyName = snap.storyName
                                         , titleEmitted = not (String.isEmpty snap.storyName)
                                     }
-                                , []
-                                , yieldCmd
                                 )
+                                []
+                                yieldCmd
 
 
 {-| Pick the best available machine snapshot: the one captured at save time
@@ -1312,7 +1358,7 @@ andMap argDecoder funcDecoder =
     D.map2 (\f a -> f a) funcDecoder argDecoder
 
 
-resumeFrom : TurnRecord -> Session -> Result Error ( Session, List Event, Cmd Msg )
+resumeFrom : TurnRecord -> Session -> Step
 resumeFrom publicRecord (Session state) =
     let
         record : EngineTypes.TurnRecord
@@ -1321,7 +1367,7 @@ resumeFrom publicRecord (Session state) =
     in
     case ZEngine.Snapshot.restore record.snapshotBytes state.machine of
         Err message ->
-            Err (RestoreError message)
+            restoreFailed message
 
         Ok restoredMachine ->
             let
@@ -1346,7 +1392,7 @@ resumeFrom publicRecord (Session state) =
                         , currentStatusLine = Just (ZEngine.Output.statusLineFromTurnRecord record)
                     }
             in
-            Ok ( Session newState, [], yieldCmd )
+            okStep (Session newState) [] yieldCmd
 
 
 transcript : Session -> List Frame
