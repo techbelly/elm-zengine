@@ -6,7 +6,6 @@ module ZEngine.Output exposing
     , statusLineFromTurnRecord
     )
 
-import ListExtra
 import ZEngine.Snapshot
 import ZEngine.Types exposing (Frame, MoveInfo(..), PendingOutput, TurnRecord)
 import ZMachine
@@ -56,12 +55,25 @@ captureTurnRecord machine statusLine transcript existingHistory =
 
 shouldCaptureLocation : Int -> List TurnRecord -> Bool
 shouldCaptureLocation locationId existingHistory =
-    case ListExtra.last existingHistory of
+    case lastOf existingHistory of
         Nothing ->
             True
 
         Just prev ->
             prev.locationId /= locationId
+
+
+lastOf : List a -> Maybe a
+lastOf list =
+    case list of
+        [] ->
+            Nothing
+
+        [ x ] ->
+            Just x
+
+        _ :: rest ->
+            lastOf rest
 
 
 moveInfoFromMode : StatusLineMode -> MoveInfo
