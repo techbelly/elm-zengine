@@ -13,6 +13,11 @@ module ZEngine exposing
     , Prompt(..)
     , Phase(..)
     , TurnRecord
+    , Config
+    , CharPolicy(..)
+    , SavePolicy(..)
+    , RestorePolicy(..)
+    , defaultConfig
     , new
     , update
     , sendLine
@@ -61,7 +66,24 @@ import ZMachine.Types as ZTypes exposing (StepResult)
 
 
 type Session
-    = Session Internal.InternalState
+    = Session InternalState
+
+
+type alias InternalState =
+    { machine : ZMachine.ZMachine
+    , storyBytes : Bytes
+    , config : Config
+    , activePrompt : Maybe Internal.InternalPrompt
+    , inputQueue : List String
+    , transcript : List EngineTypes.Frame
+    , pendingOutput : EngineTypes.PendingOutput
+    , currentStatusLine : Maybe ZTypes.StatusLine
+    , turnHistory : List EngineTypes.TurnRecord
+    , restoringSession : Bool
+    , phase : Internal.Phase
+    , storyName : String
+    , titleEmitted : Bool
+    }
 
 
 type Msg
@@ -103,6 +125,43 @@ type Prompt
     | CharPrompt
     | SavePrompt Bytes
     | RestorePrompt
+
+
+{-| Session-wide policy for non-line prompts. Each prompt can be auto-handled
+internally (the defaults) or surfaced to the consumer as a `PromptIssued`
+event.
+-}
+type alias Config =
+    { onCharPrompt : CharPolicy
+    , onSavePrompt : SavePolicy
+    , onRestorePrompt : RestorePolicy
+    }
+
+
+type CharPolicy
+    = AutoChar Char
+    | SurfaceChar
+
+
+type SavePolicy
+    = DeclineSave
+    | SurfaceSave
+
+
+type RestorePolicy
+    = DeclineRestore
+    | SurfaceRestore
+
+
+{-| Sensible defaults that preserve pre-Config behavior: auto-send space for
+`read_char`, decline in-game saves, decline in-game restores.
+-}
+defaultConfig : Config
+defaultConfig =
+    { onCharPrompt = AutoChar ' '
+    , onSavePrompt = DeclineSave
+    , onRestorePrompt = DeclineRestore
+    }
 
 
 type alias TurnRecord =
@@ -174,7 +233,7 @@ activePrompt (Session state) =
     Maybe.map (\_ -> promptFromInternal state) state.activePrompt
 
 
-promptFromInternal : Internal.InternalState -> Prompt
+promptFromInternal : InternalState -> Prompt
 promptFromInternal state =
     case state.activePrompt of
         Just (Internal.LineActive _) ->
@@ -193,24 +252,25 @@ promptFromInternal state =
             LinePrompt
 
 
-new : Bytes -> Result Error ( Session, List Event, Cmd Msg )
-new bytes =
+new : Config -> Bytes -> Result Error ( Session, List Event, Cmd Msg )
+new config bytes =
     case ZMachine.load bytes of
         Err err ->
             Err (LoadError err)
 
         Ok machine ->
             Ok
-                ( Session (initialState machine bytes)
+                ( Session (initialState config machine bytes)
                 , []
                 , yieldCmd
                 )
 
 
-initialState : ZMachine.ZMachine -> Bytes -> Internal.InternalState
-initialState machine bytes =
+initialState : Config -> ZMachine.ZMachine -> Bytes -> InternalState
+initialState config machine bytes =
     { machine = machine
     , storyBytes = bytes
+    , config = config
     , activePrompt = Nothing
     , inputQueue = []
     , transcript = []
@@ -245,7 +305,7 @@ update msg (Session state) =
             dispatch result state
 
 
-dispatch : StepResult -> Internal.InternalState -> Result Error ( Session, List Event, Cmd Msg )
+dispatch : StepResult -> InternalState -> Result Error ( Session, List Event, Cmd Msg )
 dispatch result state =
     case result of
         ZTypes.Continue events machine ->
@@ -264,18 +324,33 @@ dispatch result state =
             Ok (onLinePrompt req events machine state)
 
         ZTypes.NeedChar events machine ->
-            Ok (onNonLinePrompt Internal.CharActive CharPrompt events machine state)
+            case state.config.onCharPrompt of
+                SurfaceChar ->
+                    Ok (onNonLinePrompt Internal.CharActive CharPrompt events machine state)
+
+                AutoChar c ->
+                    Ok (onAutoRespondPrompt (ZMachine.provideChar (String.fromChar c)) events machine state)
 
         ZTypes.NeedSave snapshot events machine ->
-            let
-                saveBytes : Bytes
-                saveBytes =
-                    ZMachine.Snapshot.encode state.machine.originalMemory snapshot
-            in
-            Ok (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
+            case state.config.onSavePrompt of
+                SurfaceSave ->
+                    let
+                        saveBytes : Bytes
+                        saveBytes =
+                            ZMachine.Snapshot.encode state.machine.originalMemory snapshot
+                    in
+                    Ok (onNonLinePrompt (Internal.SaveActive saveBytes) (SavePrompt saveBytes) events machine state)
+
+                DeclineSave ->
+                    Ok (onAutoRespondPrompt (ZMachine.provideSaveResult False) events machine state)
 
         ZTypes.NeedRestore events machine ->
-            Ok (onNonLinePrompt Internal.RestoreActive RestorePrompt events machine state)
+            case state.config.onRestorePrompt of
+                SurfaceRestore ->
+                    Ok (onNonLinePrompt Internal.RestoreActive RestorePrompt events machine state)
+
+                DeclineRestore ->
+                    Ok (onAutoRespondPrompt (ZMachine.provideRestoreResult Nothing) events machine state)
 
         ZTypes.Halted events machine ->
             let
@@ -332,7 +407,7 @@ dispatch result state =
                 )
 
 
-onLinePrompt : ZTypes.LineInputInfo -> List ZTypes.OutputEvent -> ZMachine.ZMachine -> Internal.InternalState -> ( Session, List Event, Cmd Msg )
+onLinePrompt : ZTypes.LineInputInfo -> List ZTypes.OutputEvent -> ZMachine.ZMachine -> InternalState -> ( Session, List Event, Cmd Msg )
 onLinePrompt req events machine state =
     if state.restoringSession then
         ( Session
@@ -398,7 +473,7 @@ onLinePrompt req events machine state =
                 , detectedTitle = detectedTitle
                 }
 
-            commonUpdates : Internal.InternalState -> Internal.InternalState
+            commonUpdates : InternalState -> InternalState
             commonUpdates s =
                 { s
                     | machine = machine
@@ -444,7 +519,7 @@ onNonLinePrompt :
     -> Prompt
     -> List ZTypes.OutputEvent
     -> ZMachine.ZMachine
-    -> Internal.InternalState
+    -> InternalState
     -> ( Session, List Event, Cmd Msg )
 onNonLinePrompt internalPrompt publicPrompt events machine state =
     let
@@ -505,6 +580,80 @@ onNonLinePrompt internalPrompt publicPrompt events machine state =
         }
     , outputEvents ++ statusEvents ++ [ PromptIssued publicPrompt ]
     , Cmd.none
+    )
+
+
+{-| Flush output/status like `onNonLinePrompt`, but instead of surfacing a
+`PromptIssued` event, advance the machine with the provided responder and
+stay in `Running`. Used when the session `Config` opts to auto-handle the
+prompt internally.
+-}
+onAutoRespondPrompt :
+    (ZMachine.ZMachine -> StepResult)
+    -> List ZTypes.OutputEvent
+    -> ZMachine.ZMachine
+    -> InternalState
+    -> ( Session, List Event, Cmd Msg )
+onAutoRespondPrompt respond events machine state =
+    let
+        finalOutput : EngineTypes.PendingOutput
+        finalOutput =
+            ZEngine.Output.processEvents events state.pendingOutput
+
+        newStatusLine : Maybe ZTypes.StatusLine
+        newStatusLine =
+            case finalOutput.statusLine of
+                Just sl ->
+                    Just sl
+
+                Nothing ->
+                    state.currentStatusLine
+
+        statusChanged : Bool
+        statusChanged =
+            newStatusLine /= state.currentStatusLine
+
+        hasOutput : Bool
+        hasOutput =
+            not (String.isEmpty finalOutput.text) || finalOutput.statusLine /= Nothing
+
+        transcriptAfterOutput : List EngineTypes.Frame
+        transcriptAfterOutput =
+            if hasOutput then
+                state.transcript ++ [ EngineTypes.OutputFrame finalOutput ]
+
+            else
+                state.transcript
+
+        outputEvents : List Event
+        outputEvents =
+            if hasOutput then
+                [ OutputProduced (toPublicFrame (EngineTypes.OutputFrame finalOutput)) ]
+
+            else
+                []
+
+        statusEvents : List Event
+        statusEvents =
+            case ( statusChanged, newStatusLine ) of
+                ( True, Just sl ) ->
+                    [ StatusLineChanged (toPublicStatusLine sl) ]
+
+                _ ->
+                    []
+    in
+    ( Session
+        { state
+            | machine = machine
+            , phase = Internal.Running
+            , activePrompt = Nothing
+            , transcript = transcriptAfterOutput
+            , pendingOutput = emptyPendingOutput
+            , currentStatusLine = newStatusLine
+        }
+    , outputEvents ++ statusEvents
+    , Task.succeed ()
+        |> Task.perform (\_ -> StepCompleted (respond machine))
     )
 
 
@@ -717,7 +866,7 @@ sendLine input (Session state) =
                 newTranscript =
                     state.transcript ++ [ EngineTypes.InputFrame { command = truncated } ]
 
-                newState : Internal.InternalState
+                newState : InternalState
                 newState =
                     { state
                         | transcript = newTranscript
@@ -750,7 +899,7 @@ sendChar c (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.CharActive ) ->
             let
-                newState : Internal.InternalState
+                newState : InternalState
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
@@ -775,7 +924,7 @@ sendSaveResult ok (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just (Internal.SaveActive _) ) ->
             let
-                newState : Internal.InternalState
+                newState : InternalState
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
@@ -799,7 +948,7 @@ sendRestore maybeBytes (Session state) =
     case ( state.phase, state.activePrompt ) of
         ( Internal.Waiting, Just Internal.RestoreActive ) ->
             let
-                newState : Internal.InternalState
+                newState : InternalState
                 newState =
                     { state | activePrompt = Nothing, phase = Internal.Running }
             in
@@ -837,7 +986,8 @@ stripTrailingNewline s =
 
 
 restore :
-    { story : Bytes
+    { config : Config
+    , story : Bytes
     , snapshot : Bytes
     , transcript : List Frame
     , turnHistory : List TurnRecord
@@ -857,9 +1007,9 @@ restore args =
 
                 Ok restoredMachine ->
                     let
-                        base : Internal.InternalState
+                        base : InternalState
                         base =
-                            initialState restoredMachine args.story
+                            initialState args.config restoredMachine args.story
                     in
                     Ok
                         ( Session
@@ -898,7 +1048,7 @@ resumeFrom publicRecord (Session state) =
                 truncatedHistory =
                     List.filter (\r -> r.index <= record.index) state.turnHistory
 
-                newState : Internal.InternalState
+                newState : InternalState
                 newState =
                     { state
                         | machine = restoredMachine
