@@ -37,19 +37,8 @@ ZEngine is a standalone Elm package. Add it plus the two deps it needs
 to your `elm.json` (the exact dep list mirrors ZEngine's own, since it
 has to serialize story bytes as Base64):
 
-```json
-"dependencies": {
-    "direct": {
-        "beng/elm-zengine": "1.0.0",
-        "danfishgold/base64-bytes": "1.1.0",
-        "elm/browser": "1.0.2",
-        "elm/bytes": "1.0.8",
-        "elm/core": "1.0.5",
-        "elm/file": "1.0.5",
-        "elm/html": "1.0.1",
-        "elm/json": "1.1.4"
-    }
-}
+```sh
+$ elm install techbelly/elm-zengine
 ```
 
 ## The model
